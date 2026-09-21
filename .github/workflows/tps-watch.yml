@@ -26,6 +26,10 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          # Check out the branch tip at job start, not the (possibly stale)
+          # commit that was current when the run was triggered.
+          ref: ${{ github.ref_name }}
 
       - name: Run watcher
         env:
@@ -36,13 +40,52 @@ jobs:
 
       - name: Save state
         if: always()
+        env:
+          BRANCH: ${{ github.ref_name }}
         run: |
-          if [ -f seen.json ] && [ -n "$(git status --porcelain seen.json)" ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          set -euo pipefail
+          if [ ! -f seen.json ]; then echo "No state file to save."; exit 0; fi
+          cp seen.json "$RUNNER_TEMP/seen.local.json"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          for attempt in 1 2 3 4 5; do
+            # Start from the latest remote state, then merge this run's state into it.
+            git fetch --depth=1 origin "$BRANCH"
+            git reset --hard FETCH_HEAD
+            python3 - "$RUNNER_TEMP/seen.local.json" <<'PY'
+          import json, sys
+          with open(sys.argv[1]) as f:
+              local = json.load(f)
+          try:
+              with open("seen.json") as f:
+                  remote = json.load(f)
+          except (FileNotFoundError, json.JSONDecodeError):
+              remote = {}
+          merged = {
+              "fr_seen": sorted(set(remote.get("fr_seen", [])) | set(local.get("fr_seen", []))),
+              "i9_seen": sorted(set(remote.get("i9_seen", [])) | set(local.get("i9_seen", []))),
+              "i9_initialized": bool(remote.get("i9_initialized")) or bool(local.get("i9_initialized")),
+              "tps_2027_alerted": bool(remote.get("tps_2027_alerted")) or bool(local.get("tps_2027_alerted")),
+              "last_heartbeat_week": max(remote.get("last_heartbeat_week", ""),
+                                         local.get("last_heartbeat_week", "")),
+          }
+          with open("seen.json", "w") as f:
+              json.dump(merged, f, indent=2)
+              f.write("\n")
+          PY
+            if [ -z "$(git status --porcelain seen.json)" ]; then
+              echo "State already up to date."
+              exit 0
+            fi
             git add seen.json
             git commit -m "Update watcher state"
-            git push
-          else
-            echo "State unchanged."
-          fi
+            if git push origin "HEAD:$BRANCH"; then
+              echo "State saved (attempt $attempt)."
+              exit 0
+            fi
+            echo "Push rejected on attempt $attempt; retrying..."
+            sleep $((attempt * 5))
+          done
+          echo "Could not save state after 5 attempts."
+          exit 1
