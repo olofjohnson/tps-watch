@@ -1,0 +1,48 @@
+name: TPS Watch
+
+on:
+  schedule:
+    # Every 30 minutes, offset from the top of the hour (GitHub's busiest time).
+    # Times are UTC.
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Send a test notification with a status summary"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write   # lets the job save seen.json back to the repository
+
+concurrency:
+  group: tps-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run watcher
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TEST_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.test }}
+          LOOKBACK_START: "2026-08-01"
+        run: python3 watch.py
+
+      - name: Save state
+        if: always()
+        run: |
+          if [ -f seen.json ] && [ -n "$(git status --porcelain seen.json)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add seen.json
+            git commit -m "Update watcher state"
+            git push
+          else
+            echo "State unchanged."
+          fi
